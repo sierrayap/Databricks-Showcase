@@ -20,7 +20,7 @@
 # COMMAND ----------
 
 # Presenter: set these once before the workshop. Participants never change them.
-LAB_CATALOG = "sierra_yap_demo_dump_catalog"
+LAB_CATALOG = "databricks_showcase_2026"
 LAB_CODE = "mapi"  # unique per showcase so cleanup in one lab never touches another
 SUMMARY_MODEL = "system.ai.databricks-claude-sonnet-4-6"  # primary model behind the AI Gateway model service (also used by the agent)
 FALLBACK_MODEL = "system.ai.databricks-claude-sonnet-4-5"

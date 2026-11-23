@@ -17,7 +17,7 @@
 # COMMAND ----------
 
 # Presenter: set these once before the workshop. Participants never change them.
-LAB_CATALOG = "sierra_yap_demo_dump_catalog"  # Change to the workshop catalog in Greenstone workspaces
+LAB_CATALOG = "databricks_showcase_2026"
 LAB_CODE = "nba"
 
 # Keep the lab fast: small data, CPU only, no serving endpoints, no GPUs.
