@@ -7,6 +7,7 @@ Lab notebooks for the Databricks showcase. Download this whole repo as a ZIP and
 | Folder | Lab |
 |---|---|
 | `mapi-config-copilot/` | MAPI Config Copilot (Agent Bricks + Apps + Unity AI Gateway) |
+| `mapi-config-copilot/lakebase/` | MAPI part 2: move the app to Lakebase, branching, synced tables (run right after part 1) |
 | `greenstone-nba-genie-code/` | Genie Code for ML and AI (Next Best Action) |
 
 ## How to get the labs into your workspace

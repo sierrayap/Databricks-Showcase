@@ -2,5 +2,5 @@ streamlit>=1.40
 pandas
 databricks-sdk>=0.40
 databricks-sql-connector>=3.4
-psycopg[binary]>=3.2
+psycopg[binary,pool]>=3.2
 openai>=1.40
