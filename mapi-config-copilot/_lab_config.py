@@ -26,6 +26,9 @@ SUMMARY_MODEL = "system.ai.databricks-claude-opus-4-8"  # primary model behind t
 FALLBACK_MODEL = "system.ai.databricks-claude-opus-4-7"
 LAB_WAREHOUSE_ID = "deecdc0568fd2363"  # gfs-databricks.uat.dbx-sql-serverless-analytics: every lab app and notebook query uses this warehouse
 
+# The lakebase/ notebooks set CATALOG in their input cell before running this config; it wins when set.
+LAB_CATALOG = globals().get("CATALOG") or LAB_CATALOG
+
 # COMMAND ----------
 
 import hashlib
@@ -200,7 +203,7 @@ def _load_agent_core():
     os.environ["WAREHOUSE_ID"] = pick_warehouse_id()
     os.environ["MODEL_SERVICE"] = MODEL_SERVICE_FQN
     os.environ["UC_FUNCTIONS"] = UC_AGENT_FUNCTIONS
-    agent_dir = f"{notebook_dir()}/agent"
+    agent_dir = f"{lab_dir()}/agent"
     if agent_dir not in sys.path:
         sys.path.insert(0, agent_dir)
     import agent_core
@@ -281,9 +284,17 @@ def notebook_dir():
     return "/Workspace" + path.rsplit("/", 1)[0]
 
 
+def lab_dir():
+    """The lab folder that holds app/ and agent/. Notebooks in a subfolder (such as lakebase/) get its parent."""
+    import os
+
+    d = notebook_dir()
+    return d if os.path.isdir(f"{d}/app") else d.rsplit("/", 1)[0]
+
+
 # Deployment copies live inside this lab folder, so the whole lab stays in one place.
-APP_SOURCE_PATH = f"{notebook_dir()}/app_build/{PREFIX}"
-AGENT_SOURCE_PATH = f"{notebook_dir()}/app_build/{PREFIX}_agent"
+APP_SOURCE_PATH = f"{lab_dir()}/app_build/{PREFIX}"
+AGENT_SOURCE_PATH = f"{lab_dir()}/app_build/{PREFIX}_agent"
 
 
 def register(resource_type, resource_id, display_name=""):
@@ -408,7 +419,7 @@ primaryColor = "#00A77F"
 
 def write_app_source(env):
     """Copy the app code from this lab folder into your own app folder and write app.yaml with your settings."""
-    src_dir = f"{notebook_dir()}/app"
+    src_dir = f"{lab_dir()}/app"
     os_dir = APP_SOURCE_PATH
     import os
 
@@ -440,7 +451,7 @@ def write_agent_source(env):
     """Copy the Agent Bricks agent (DurableAgentServer + agent_core) into your agent folder with your settings."""
     import os
 
-    src_dir = f"{notebook_dir()}/agent"
+    src_dir = f"{lab_dir()}/agent"
     os.makedirs(AGENT_SOURCE_PATH, exist_ok=True)
     for fname in ("app.py", "agent_core.py", "requirements.txt"):
         with open(f"{src_dir}/{fname}") as f:
@@ -456,10 +467,35 @@ def write_agent_source(env):
     return AGENT_SOURCE_PATH
 
 
-def _start_deployment(name, path):
+def wait_for_workspace_files(path, timeout_s=120, poll_s=3):
+    """Files written through /Workspace can take a few seconds to reach the workspace file service. A deployment
+    started before then snapshots only some of them (for example without app.yaml), so wait until all are listed."""
+    import os
+
+    expected = {f for f in os.listdir(path) if os.path.isfile(f"{path}/{f}")}
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            listed = {o.path.rsplit("/", 1)[-1] for o in w.workspace.list(path.removeprefix("/Workspace"))}
+        except Exception:
+            listed = set()
+        if expected <= listed:
+            return
+        time.sleep(poll_s)
+    print(f"Note: {path} still lists {sorted(listed)}; deploying anyway.")
+
+
+def _start_deployment(name, path, env_vars=None):
+    """Deploy a snapshot of path. env_vars (a dict), when given, is sent with the deployment request and replaces the env list
+    in app.yaml for this deployment (the command still comes from app.yaml), so a feature flag can be flipped through the API
+    without touching the source. Pass the complete environment, not just the changed variable."""
+    wait_for_workspace_files(path)
+    body = {"source_code_path": path, "mode": "SNAPSHOT"}
+    if env_vars:
+        body["env_vars"] = [{"name": k, "value": str(v)} for k, v in env_vars.items()]
     # The workspace folder can take a moment to appear after the copy, so also retry "Path does not exist".
     dep = retry_until_ready(
-        lambda: api("POST", f"/api/2.0/apps/{name}/deployments", body={"source_code_path": path, "mode": "SNAPSHOT"}),
+        lambda: api("POST", f"/api/2.0/apps/{name}/deployments", body=body),
         what=f"{name} deployment slot",
         timeout_s=600,
         poll_s=15,
@@ -469,8 +505,8 @@ def _start_deployment(name, path):
     return dep
 
 
-def deploy_app(env):
-    return _start_deployment(APP_NAME, write_app_source(env))
+def deploy_app(env, env_vars=None):
+    return _start_deployment(APP_NAME, write_app_source(env), env_vars)
 
 
 def deploy_agent_app():

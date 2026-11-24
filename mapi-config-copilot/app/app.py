@@ -7,6 +7,13 @@ BACKEND=pglite   -> Agent Bricks session. PGlite (Postgres compiled to WebAssemb
                     Lakebase only changes the connection.
 BACKEND=uc       -> rows read and written in Unity Catalog tables (kept for reference)
 BACKEND=lakebase -> rows live in Lakebase Postgres (Lakebase session)
+
+Feature flag USE_LAKEBASE=true (set by lakebase/02_redeploy_app_with_lakebase) switches BACKEND to lakebase,
+whatever BACKEND says. The app finds the read-write endpoint of LAKEBASE_PROJECT / LAKEBASE_BRANCH and logs in
+as its own service principal with short-lived OAuth tokens. Without the flag nothing changes.
+
+The Metrics tab reads METRICS_TABLE (a Lakebase synced table created by lakebase/03_metrics_and_sync).
+Until that table exists in the database the tab says "Coming soon...".
 """
 
 import hashlib
@@ -22,17 +29,28 @@ import streamlit as st
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 
-BACKEND = os.getenv("BACKEND", "pglite")
+
+def _flag(name):
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+USE_LAKEBASE = _flag("USE_LAKEBASE")
+BACKEND = "lakebase" if USE_LAKEBASE else os.getenv("BACKEND", "pglite")
 FQ_SCHEMA = os.getenv("FQ_SCHEMA", "")
 WAREHOUSE_ID = os.getenv("WAREHOUSE_ID", "")
 UC_FUNCTIONS = os.getenv("UC_FUNCTIONS", "search_rows,propose_change_set,find_issues,lookup_rules")
 MODEL_SERVICE = os.getenv("MODEL_SERVICE", "")
 AGENT_URL = os.getenv("AGENT_URL", "").rstrip("/")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+LAKEBASE_PROJECT = os.getenv("LAKEBASE_PROJECT", "")
+LAKEBASE_BRANCH = os.getenv("LAKEBASE_BRANCH", "production")
+# Fallback when the project lookup is not possible: set by the redeploy notebook (the platform also injects
+# LAKEBASE_ENDPOINT / PGHOST / PGDATABASE for an app with a Lakebase resource).
 LAKEBASE_ENDPOINT = os.getenv("LAKEBASE_ENDPOINT", "")
-LAKEBASE_HOST = os.getenv("LAKEBASE_HOST", "")
-LAKEBASE_DB = os.getenv("LAKEBASE_DB", "mapi")
+LAKEBASE_HOST = os.getenv("LAKEBASE_HOST") or os.getenv("PGHOST", "")
+LAKEBASE_DB = os.getenv("LAKEBASE_DB") or os.getenv("PGDATABASE") or "databricks_postgres"
 PG_SCHEMA = os.getenv("PG_SCHEMA") or os.getenv("LAKEBASE_SCHEMA", "mapi")
+METRICS_TABLE = os.getenv("METRICS_TABLE", "")  # <schema>.<table> of the synced metrics table
 
 cfg = Config()
 w = WorkspaceClient()
@@ -133,18 +151,68 @@ def _uc_conn():
     )
 
 
-def _pg_conn():
-    import psycopg
+@st.cache_resource
+def lakebase_target():
+    """(endpoint path, host) of the read-write compute of LAKEBASE_PROJECT / LAKEBASE_BRANCH."""
+    if LAKEBASE_PROJECT:
+        try:
+            path = f"/api/2.0/postgres/projects/{LAKEBASE_PROJECT}/branches/{LAKEBASE_BRANCH}/endpoints"
+            for ep in w.api_client.do("GET", path).get("endpoints") or []:
+                kind = (ep.get("status") or {}).get("endpoint_type") or (ep.get("spec") or {}).get("endpoint_type")
+                host = ((ep.get("status") or {}).get("hosts") or {}).get("host")
+                if kind == "ENDPOINT_TYPE_READ_WRITE" and host:
+                    print(f"Lakebase: {ep['name']} at {host}, database {LAKEBASE_DB}")
+                    return ep["name"], host
+        except Exception as e:
+            print(f"Lakebase: could not look up {LAKEBASE_PROJECT}/{LAKEBASE_BRANCH} ({e}); using LAKEBASE_ENDPOINT")
+    if LAKEBASE_ENDPOINT and LAKEBASE_HOST:
+        return LAKEBASE_ENDPOINT, LAKEBASE_HOST
+    raise RuntimeError(
+        f"USE_LAKEBASE is on, but no Lakebase endpoint was found for project '{LAKEBASE_PROJECT}' branch "
+        f"'{LAKEBASE_BRANCH}'. Re-run lakebase/02_redeploy_app_with_lakebase."
+    )
 
-    token = w.api_client.do("POST", "/api/2.0/postgres/credentials", body={"endpoint": LAKEBASE_ENDPOINT})["token"]
-    return psycopg.connect(
-        host=LAKEBASE_HOST,
-        port=5432,
-        dbname=LAKEBASE_DB,
-        user=os.getenv("DATABRICKS_CLIENT_ID"),
-        password=token,
-        sslmode="require",
-        autocommit=True,
+
+@st.cache_resource
+def _token_cache():
+    return {"token": None, "expires": 0.0, "lock": threading.Lock()}
+
+
+def _lakebase_token():
+    """OAuth token used as the Postgres password. Tokens last an hour; refresh well before that."""
+    cache = _token_cache()
+    with cache["lock"]:
+        if time.time() > cache["expires"]:
+            endpoint, _ = lakebase_target()
+            cache["token"] = w.api_client.do("POST", "/api/2.0/postgres/credentials", body={"endpoint": endpoint})["token"]
+            cache["expires"] = time.time() + 40 * 60
+        return cache["token"]
+
+
+@st.cache_resource
+def lakebase_pool():
+    """Connection pool shared by every user of the app. New connections log in with a current OAuth token,
+    as the app's service principal (DATABRICKS_CLIENT_ID), or as you when the app runs locally."""
+    import psycopg
+    from psycopg_pool import ConnectionPool
+
+    _, host = lakebase_target()
+    pg_user = os.getenv("DATABRICKS_CLIENT_ID") or w.current_user.me().user_name
+
+    class OAuthConnection(psycopg.Connection):
+        @classmethod
+        def connect(cls, conninfo="", **kwargs):
+            kwargs["password"] = _lakebase_token()
+            return super().connect(conninfo, **kwargs)
+
+    return ConnectionPool(
+        connection_class=OAuthConnection,
+        kwargs={"host": host, "port": 5432, "dbname": LAKEBASE_DB, "user": pg_user, "sslmode": "require", "autocommit": True},
+        min_size=1,
+        max_size=5,
+        max_lifetime=45 * 60,
+        check=ConnectionPool.check_connection,  # drops connections closed while the compute scaled to zero
+        open=True,
     )
 
 
@@ -201,8 +269,16 @@ def run(sql_text, params=None, fetch=True):
             with lock:
                 return _pg_execute(conn, sql_text, params, fetch)
     if BACKEND == "lakebase":
-        with _pg_conn() as conn:
-            return _pg_execute(conn, sql_text, params, fetch)
+        import psycopg
+
+        try:
+            with lakebase_pool().connection() as conn:
+                return _pg_execute(conn, sql_text, params, fetch)
+        except psycopg.OperationalError:
+            # The compute may have just woken from scale-to-zero. One retry on a fresh connection.
+            time.sleep(1)
+            with lakebase_pool().connection() as conn:
+                return _pg_execute(conn, sql_text, params, fetch)
     with _uc_conn() as conn, conn.cursor() as cur:
         cur.execute(sql_text, params)
         if fetch and cur.description:
@@ -300,6 +376,79 @@ def set_uploads_paused(value, user):
     )
 
 
+def load_metrics():
+    """The synced metrics table, or None while it is not in this database (or not readable by the app yet)."""
+    if "." not in METRICS_TABLE:
+        return None
+    schema, name = METRICS_TABLE.split(".", 1)
+    try:
+        found = run(
+            "SELECT count(*) AS n FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace s ON s.oid = c.relnamespace "
+            "WHERE s.nspname = :s AND c.relname = :t",
+            {"s": schema, "t": name},
+        )
+        if found is None or int(found.iloc[0]["n"]) == 0:
+            return None
+        return run(f"SELECT * FROM {METRICS_TABLE}")
+    except Exception as e:
+        print(f"Metrics table {METRICS_TABLE} not readable yet: {str(e)[:200]}")
+        return None
+
+
+# Approved / draft / archived fills (validated against the white chart surface; archived is a deliberate neutral).
+STATUS_FILLS = ["#00805F", "#EDA100", "#898781"]
+SERIES_FILLS = ["#2A78D6", "#EB6834", "#1BAF7A"]
+
+
+def render_metrics(m):
+    m = m.copy()
+    numeric = [c for c in m.columns if c not in ("brand", "campaign", "campaign_month", "last_activity_at", "refreshed_at")]
+    m[numeric] = m[numeric].apply(pd.to_numeric, errors="coerce")  # Postgres NUMERIC arrives as Decimal objects
+    active = int(m.approved_rows.sum() + m.draft_rows.sum())
+    approvals = int(m.approvals.sum())
+    hours = (m.avg_hours_to_approve.fillna(0) * m.approvals).sum() / approvals if approvals else None
+    edits = int(m.edits.sum())
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Active rows", f"{active:,}", help="Approved + draft rows across every campaign")
+    k2.metric("Drafts waiting", f"{int(m.draft_rows.sum()):,}")
+    k3.metric("Rows with issues", f"{int(m.issue_rows.sum()):,}", help="Off-brand URL, wrong-brand copy, product not sold by the brand, or approved content changed after approval")
+    k4.metric("Hours to approval", f"{hours:.1f}" if hours is not None else "-", help="Average time from a row's last edit to its approval")
+    k5.metric("Edits by the assistant", f"{m.assistant_edits.sum() / edits:.0%}" if edits else "-")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Rows by brand and status**")
+        by_status = m.groupby("brand")[["approved_rows", "draft_rows", "archived_rows"]].sum()
+        by_status.columns = ["Approved", "Draft", "Archived"]
+        st.bar_chart(by_status, horizontal=True, stack=True, color=STATUS_FILLS, x_label="", y_label="Rows", height=300)
+    with c2:
+        st.markdown("**Hours from last edit to approval, by brand**")
+        rated = m[m.approvals > 0].assign(w=lambda d: d.avg_hours_to_approve.fillna(0) * d.approvals)
+        by_brand = rated.groupby("brand")[["w", "approvals"]].sum()
+        by_brand["Hours"] = (by_brand.w / by_brand.approvals).round(1)
+        st.bar_chart(by_brand[["Hours"]], horizontal=True, color=SERIES_FILLS[0], x_label="", y_label="Average hours", height=300)
+
+    st.markdown("**Edits and approvals by campaign month**")
+    trend = m.groupby("campaign_month")[["people_edits", "assistant_edits", "approvals"]].sum().sort_index()
+    trend.index = pd.to_datetime(trend.index).strftime("%Y-%m")  # one point per campaign month
+    trend.columns = ["Edits by people", "Edits by the assistant", "Approvals"]
+    st.line_chart(trend, color=SERIES_FILLS, x_label="Campaign month", y_label="Changes", height=320)
+
+    issues = m[m.issue_rows > 0][["brand", "campaign", "issue_rows", "total_rows"]].sort_values("issue_rows", ascending=False)
+    st.markdown("**Where the issues are**")
+    if issues.empty:
+        st.info("No rows with issues.")
+    else:
+        st.dataframe(style_table(issues, brand_col="brand"), hide_index=True, use_container_width=True)
+
+    refreshed = pd.to_datetime(m.refreshed_at).max() if "refreshed_at" in m else None
+    st.caption(f"Lakebase synced table {METRICS_TABLE}, aggregated in Unity Catalog and synced back to Postgres"
+               + (f" · refreshed {refreshed:%d %b %Y %H:%M} UTC" if refreshed is not None and not pd.isna(refreshed) else ""))
+    with st.expander("Data table"):
+        st.dataframe(m.sort_values(["brand", "campaign"]), hide_index=True, use_container_width=True)
+
+
 # ---------------- assistant + gateway ----------------
 
 
@@ -378,7 +527,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 if BACKEND == "lakebase":
-    storage_label = "Lakebase Postgres"
+    storage_label = f"Lakebase Postgres ({LAKEBASE_PROJECT or 'project'} / {LAKEBASE_BRANCH})"
 elif BACKEND == "pglite":
     storage_label = "PGlite, in-memory Postgres (resets when the app restarts)"
 else:
@@ -396,7 +545,9 @@ with st.sidebar:
     except Exception as e:
         st.error(f"Could not read upload controls: {e}")
 
-tab_edit, tab_assist, tab_approve, tab_history = st.tabs(["Editor", "Assistant", "Approval queue", "Row history"])
+tab_edit, tab_assist, tab_approve, tab_history, tab_metrics = st.tabs(
+    ["Editor", "Assistant", "Approval queue", "Row history", "Metrics"]
+)
 
 with tab_edit:
     try:
@@ -520,3 +671,13 @@ with tab_history:
                 st.info("No recorded changes for this row yet.")
         except Exception as e:
             st.error(str(e))
+
+with tab_metrics:
+    metrics = load_metrics()
+    if metrics is None or metrics.empty:
+        st.info("Coming soon...")
+    else:
+        try:
+            render_metrics(metrics)
+        except Exception as e:
+            st.error(f"Could not draw the metrics: {e}")
