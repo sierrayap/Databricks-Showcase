@@ -24,7 +24,7 @@ LAB_CATALOG = "databricks_showcase_2026"
 LAB_CODE = "mapi"  # unique per showcase so cleanup in one lab never touches another
 SUMMARY_MODEL = "system.ai.databricks-claude-opus-4-8"  # primary model behind the AI Gateway model service (also used by the agent)
 FALLBACK_MODEL = "system.ai.databricks-claude-opus-4-7"
-LAB_WAREHOUSE_ID = None  # None = auto-pick a serverless SQL warehouse the app can use
+LAB_WAREHOUSE_ID = "deecdc0568fd2363"  # gfs-databricks.uat.dbx-sql-serverless-analytics: every lab app and notebook query uses this warehouse
 
 # COMMAND ----------
 
