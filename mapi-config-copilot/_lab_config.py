@@ -22,8 +22,8 @@
 # Presenter: set these once before the workshop. Participants never change them.
 LAB_CATALOG = "databricks_showcase_2026"
 LAB_CODE = "mapi"  # unique per showcase so cleanup in one lab never touches another
-SUMMARY_MODEL = "system.ai.databricks-claude-sonnet-4-6"  # primary model behind the AI Gateway model service (also used by the agent)
-FALLBACK_MODEL = "system.ai.databricks-claude-sonnet-4-5"
+SUMMARY_MODEL = "system.ai.databricks-claude-opus-4-8"  # primary model behind the AI Gateway model service (also used by the agent)
+FALLBACK_MODEL = "system.ai.databricks-claude-opus-4-7"
 LAB_WAREHOUSE_ID = None  # None = auto-pick a serverless SQL warehouse the app can use
 
 # COMMAND ----------
